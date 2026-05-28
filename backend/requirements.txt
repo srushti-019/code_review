@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+python-multipart
+psycopg2-binary
+pgvector
+sentence-transformers
+transformers
+torch
+pymupdf
+groq
+numpy
+langchain-text-splitters
+scikit-learn
+rank-bm25
+pyspellchecker
