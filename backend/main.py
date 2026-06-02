@@ -2,11 +2,11 @@ from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel    
 
-
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import CrossEncoder
 from rank_bm25 import BM25Okapi
 from groq import Groq
+from dotenv import load_dotenv
 
 
 from pdf_utils import extract_pdf_text
@@ -19,9 +19,7 @@ import shutil
 import os
 import re
 
-
 app = FastAPI()
-
 
 app.add_middleware(
     CORSMiddleware,
@@ -31,7 +29,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
+load_dotenv()
 client = Groq(
     api_key=os.getenv("GROQ_API_KEY")
 )
@@ -128,6 +126,24 @@ def clean_citation_text(text):
     return text.strip()
 
 
+def cosine_similarity(v1, v2):
+    v1 = np.array(v1)
+    v2 = np.array(v2)
+
+    denominator = (
+        np.linalg.norm(v1)
+        * np.linalg.norm(v2)
+    )
+
+    if denominator == 0:
+        return 0.0
+
+    return float(
+        np.dot(v1, v2)
+        / denominator
+    )
+
+
 @app.get("/")
 def home():
     return {"message": "RAG Running"}
@@ -191,7 +207,7 @@ async def upload_pdf(file: UploadFile = File(...)):   # UploadFile = uploaded pd
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=800,
             chunk_overlap=200
-        )
+        ) 
         current_index = 0
         for page in pages:  
             page_text = clean_text(
@@ -323,7 +339,7 @@ def bm25_search(question, top_k=25):
 
 def merge_results(vector_results, bm25_results):
     merged = {}
-    for item in vector_results:
+    for item in vector_results:     
         merged[item["id"]] = item
     for item in bm25_results:
         if item["id"] not in merged:    # chunk not in vector results
@@ -435,7 +451,8 @@ DOCUMENT:
 Rules:
 1. Use ONLY document context
 2. No hallucination
-3. If answer not found then say:
+3. Give only the answer itself
+4. If answer not found then say:
 Information not found in document.
 """
 
@@ -466,9 +483,76 @@ def compute_answer_score(chunks):  # avg relevance score
     )
 
 
+def get_answer_citations(
+    answer,
+    chunks,
+    top_n=3
+):
+
+    if not chunks:
+        return []
+
+    pairs = [
+        [answer, chunk["chunk_text"]]
+        for chunk in chunks
+    ]
+
+    scores = reranker.predict(
+        pairs
+    )
+
+    scored_chunks = []
+
+    for chunk, score in zip(
+        chunks,
+        scores
+    ):
+
+        scored_chunks.append(
+            (
+                float(score),
+                chunk
+            )
+        )
+
+    scored_chunks.sort(
+        key=lambda x: x[0],
+        reverse=True
+    )
+
+    citations = []
+
+    for rank, (score, chunk) in enumerate(
+        scored_chunks[:top_n],
+        start=1
+    ):
+
+        citations.append({
+
+            "citation_rank":
+            rank,
+
+            "page_range":
+            str(chunk["page_start"]),
+
+            "matched_text":
+            clean_citation_text(
+                chunk["chunk_text"]
+            ),
+
+            "score":
+            round(score, 4)
+        })
+
+    return citations
+
+
+
 @app.post("/query")
 async def query(data: QuestionRequest):
+
     try:
+
         cursor.execute(
             """
             SELECT id
@@ -477,12 +561,16 @@ async def query(data: QuestionRequest):
             LIMIT 1
             """
         )
+
         latest_doc = cursor.fetchone()
+
         if not latest_doc:
             return {
                 "error": "No document uploaded"
             }
+
         document_id = latest_doc[0]
+
         question = clean_text(
             data.question
         )
@@ -512,128 +600,135 @@ async def query(data: QuestionRequest):
         )
 
         if not reranked:
+
             return {
                 "question": question,
                 "model_used": selected_model,
                 "top_k_answers": []
             }
+
         windows = []
-        step = 3
 
+        if len(reranked) > 0:
+            windows.append(
+                reranked[:5]
+            )
 
-        for i in range(0, min(len(reranked), 12), step):
-            window = reranked[i:i + step]
-            if len(window) == 0:
-                continue
-            windows.append(window)
+        if len(reranked) > 5:
+            windows.append(
+                reranked[5:10]
+            )
 
-        candidate_answers = []   # store final answers
-        used_answers = set()     # avoid duplicates
-        previous_answers = ""    # memory for llm
+        if len(reranked) > 10:
+            windows.append(
+                reranked[10:15]
+            )
 
-        for window in windows:
+        candidate_answers = []
+
+        used_answers = set()
+
+        previous_answers = ""
+
+        for rank, window in enumerate(
+            windows,
+            start=1
+        ):
+
             answer = generate_answer(
                 question,
                 window,
                 selected_model,
                 previous_answers
             )
-            answer_clean = normalize_text(answer)
-            if answer_clean in used_answers:   # remove duplicate answers
-                continue
 
-            used_answers.add(answer_clean)
-            previous_answers += "\n" + answer  # next window gets prev answer included in prompt to avoid duplication
-            not_found = (
-                "information not found"
-                in answer_clean
+            answer_clean = normalize_text(
+                answer
             )
 
-            if not_found:
-                candidate_answers.append({
-                    "confidence": 0.0,
-                    "answer": answer,
-                    "citation_ranges": [],
-                    "citations": [],
-                    "answer_quality": 0
-                })
+            if answer_clean in used_answers:
                 continue
-            citations = []
 
-            citation_scores = []
-            answer_words = set(normalize_text(answer).split()) # words in generated answer used to match chunk
-
-            for chunk in window:
-                chunk_words = set(normalize_text(chunk["chunk_text"]).split())
-                overlap = len(answer_words.intersection(chunk_words))  # measure word match betn answer and chunk
-                combined_score = (overlap + (chunk["final_score"]* 100)) # combine vector score, overlap
-                citation_scores.append((combined_score, chunk))
-
-            citation_scores = sorted(
-                citation_scores,
-                key=lambda x: x[0],
-                reverse=True
+            used_answers.add(
+                answer_clean
             )
 
-            for _, chunk in citation_scores[:2]:   # pick top 2 citations
-                text = clean_text(
-                    chunk["chunk_text"]
-                )
+            previous_answers += (
+                "\n" + answer
+            )
 
-                if len(text) > 500:
-                    last_period = text[:500].rfind(".")
-                    if last_period != -1:    #
-                        text = text[:last_period + 1]
-                citations.append({
-                    "page_range":
-                    str(chunk["page_start"]),
-                    "matched_text":
-                    text
-                })
-
-            avg_score = float(   # retrieval quality
-                sum([
+            retrieval_score = round(
+                sum(
                     c["final_score"]
                     for c in window
-                ]) / len(window)
-            )
-
-            quality_bonus = min(   # answer quality  = is the answer complete or too short
-                len(answer.split()) / 40,      # 40 words
-                1.0
-            )
-
-            final_confidence = round(
-                (
-                    avg_score * 0.8
-                    +
-                    quality_bonus * 0.2
-                ),
+                ) / len(window),
                 4
             )
 
+            if (
+                "information not found"
+                in answer_clean
+            ):
+
+                candidate_answers.append({
+
+                    "answer_rank":
+                    rank,
+
+                    "retrieval_score":
+                    retrieval_score,
+
+                    "answer":
+                    answer,
+
+                    "citation_ranges":
+                    [],
+
+                    "citations":
+                    []
+                })
+
+                continue
+
+            citations = get_answer_citations(
+                answer,
+                window,
+                top_n=3
+            )
+
             candidate_answers.append({
-                "confidence": final_confidence,
-                "answer": answer,
-                "citation_ranges": sorted(
-                    list(set([
-                        str(c["page_range"])
-                        for c in citations
-                    ])),
+
+                "answer_rank":
+                rank,
+
+                "retrieval_score":
+                retrieval_score,
+
+                "answer":
+                answer,
+
+                "citation_ranges":
+                sorted(
+                    list(
+                        set(
+                            c["page_range"]
+                            for c in citations
+                        )
+                    ),
                     key=int
                 ),
-                "citations": citations,
-                "answer_quality":
-                quality_bonus
+
+                "citations":
+                citations
             })
 
         filtered = []
-        # remove answers that are too short, irrelevant answers  
+
         for ans in candidate_answers:
+
             text = normalize_text(
                 ans["answer"]
             )
-
 
             if (
                 len(text) < 15
@@ -643,40 +738,61 @@ async def query(data: QuestionRequest):
             ):
                 continue
 
-            filtered.append(ans)
+            filtered.append(
+                ans
+            )
 
+        filtered = sorted(
 
-        filtered = sorted(   # answers ranked based on confidence + answer quality
             filtered,
-            key=lambda x: (
-                x["confidence"],
-                x["answer_quality"]
-            ),
+
+            key=lambda x:
+            x["retrieval_score"],
+
             reverse=True
         )
 
-
         final_answers = []
-        for i, ans in enumerate(filtered[:3]):  # top 3 answers
+
+        for i, ans in enumerate(
+            filtered[:3],
+            start=1
+        ):
+
             final_answers.append({
-                "answer_rank": i + 1,
-                "confidence": ans["confidence"],
-                "answer": ans["answer"],
+
+                "answer_rank":
+                i,
+
+                "retrieval_score":
+                ans["retrieval_score"],
+
+                "answer":
+                ans["answer"],
+
                 "citation_ranges":
                 ans["citation_ranges"],
+
                 "citations":
                 ans["citations"]
             })
 
         return {
-            "question": question,
-            "model_used": selected_model,
-            "top_k_answers": final_answers
+
+            "question":
+            question,
+
+            "model_used":
+            selected_model,
+
+            "top_k_answers":
+            final_answers
         }
 
     except Exception as e:
+
         conn.rollback()
+
         return {
             "error": str(e)
         }
-
